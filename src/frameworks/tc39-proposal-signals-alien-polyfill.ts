@@ -4,29 +4,25 @@ import { ReactiveFramework } from "../util/reactiveFramework";
 export namespace Signal {
   const WATCHER_PLACEHOLDER = Symbol('watcher') as any;
 
-  const {endTrack, link, propagate, startTrack, processQueuedEffects, processComputedUpdate} =
-    alien.createSystem({
-      computed: {
-        is(sub): sub is Computed {
-          return sub instanceof Computed;
-        },
-        update(computed) {
-          return computed.update();
-        },
-      },
-      effect: {
-        is(sub): sub is subtle.Watcher {
-          return sub instanceof subtle.Watcher;
-        },
-        notify(watcher: subtle.Watcher) {
-          if (watcher.flags & alien.SubscriberFlags.Dirty) {
-            watcher.run();
-            return true;
-          }
-          return false;
-        },
-      },
-    });
+  const {
+    endTracking,
+    link,
+    propagate,
+    startTracking,
+    processComputedUpdate,
+    processEffectNotifications,
+  } = alien.createReactiveSystem({
+    updateComputed(computed: Computed) {
+      return computed.update();
+    },
+    notifyEffect(watcher: subtle.Watcher) {
+      if (watcher.flags & alien.SubscriberFlags.Dirty) {
+        watcher.run();
+        return true;
+      }
+      return false;
+    },
+  });
 
   let activeSub: alien.Subscriber | undefined;
 
@@ -76,7 +72,7 @@ export namespace Signal {
       }
       if (activeSub !== undefined) {
         if (link(this, activeSub)) {
-          const newSub = this.subsTail!;
+          const newSub = this.subsTail!.sub;
           if (newSub instanceof Computed && newSub.watchCount) {
             this.onWatched();
           }
@@ -94,7 +90,7 @@ export namespace Signal {
         const subs = this.subs;
         if (subs !== undefined) {
           propagate(subs);
-          processQueuedEffects();
+          processEffectNotifications();
         }
       }
     }
@@ -105,7 +101,7 @@ export namespace Signal {
     subsTail: alien.Link | undefined = undefined;
     deps: alien.Link | undefined = undefined;
     depsTail: alien.Link | undefined = undefined;
-    flags = alien.SubscriberFlags.Dirty;
+    flags = alien.SubscriberFlags.Computed | alien.SubscriberFlags.Dirty;
     isError = true;
     watchCount = 0;
     currentValue: T | undefined = undefined;
@@ -144,22 +140,20 @@ export namespace Signal {
     }
 
     get() {
-      if (this.flags & alien.SubscriberFlags.Tracking) {
-        throw new Error('Cycles detected');
-      }
       if (activeSub === WATCHER_PLACEHOLDER) {
         throw new Error('Cannot read from computed inside watcher');
       }
       const flags = this.flags;
-      if (flags) {
+      if (flags & alien.SubscriberFlags.Tracking) {
+        throw new Error('Cycles detected');
+      }
+      if (flags & (alien.SubscriberFlags.Dirty | alien.SubscriberFlags.PendingComputed)) {
         processComputedUpdate(this, flags);
       }
       if (activeSub !== undefined) {
-        if (link(this, activeSub)) {
-          const newSub = this.subsTail!;
-          if (newSub instanceof Computed && newSub.watchCount) {
-            this.onWatched();
-          }
+        const newSub = link(this, activeSub)?.sub;
+        if (newSub instanceof Computed && newSub.watchCount) {
+          this.onWatched();
         }
       }
       if (this.isError) {
@@ -171,7 +165,7 @@ export namespace Signal {
     update(): boolean {
       const prevSub = activeSub;
       activeSub = this;
-      startTrack(this);
+      startTracking(this);
       const oldValue = this.currentValue;
       try {
         const newValue = this.getter();
@@ -200,7 +194,7 @@ export namespace Signal {
           }
         }
         activeSub = prevSub;
-        endTrack(this);
+        endTracking(this);
       }
     }
   }
@@ -211,7 +205,7 @@ export namespace Signal {
     export class Watcher implements alien.Subscriber {
       deps: alien.Link | undefined = undefined;
       depsTail: alien.Link | undefined = undefined;
-      flags = alien.SubscriberFlags.None;
+      flags = alien.SubscriberFlags.Effect;
       watchList = new Set<AnySignal>();
 
       constructor(private fn: () => void) {}
@@ -245,21 +239,21 @@ export namespace Signal {
           this.watchList.delete(signal);
           signal.onUnwatched();
         }
-        startTrack(this);
+        startTracking(this);
         for (let _link = this.deps; _link !== undefined; _link = _link.nextDep) {
           const dep = _link.dep as AnySignal;
           if (this.watchList.has(dep)) {
             link(dep, this);
           }
         }
-        endTrack(this);
+        endTracking(this);
       }
 
       getPending() {
         return introspectSources(this).filter(
           (source) =>
             source instanceof Computed &&
-            source.flags & (alien.SubscriberFlags.CheckRequired | alien.SubscriberFlags.Dirty),
+            source.flags & (alien.SubscriberFlags.PendingComputed | alien.SubscriberFlags.Dirty),
         );
       }
     }
