@@ -5,14 +5,13 @@ export namespace Signal {
   const WATCHER_PLACEHOLDER = Symbol('watcher') as any;
 
   const {
+    endTracking,
     link,
     propagate,
-    checkDirty,
-    endTracking,
     startTracking,
     processComputedUpdate,
     processEffectNotifications,
-  } = alien.pullmodel.createReactiveSystem({
+  } = alien.createReactiveSystem({
     updateComputed(computed: Computed) {
       return computed.update();
     },
@@ -23,22 +22,14 @@ export namespace Signal {
       }
       return false;
     },
-    shouldCheckDirty(computed: Computed) {
-      if (computed.globalVersion !== globalVersion) {
-        computed.globalVersion = globalVersion;
-        return true;
-      }
-      return false;
-    },
-    onWatched(dep: AnySignal) {
-      dep.options?.[subtle.watched]?.call(dep);
-    },
-    onUnwatched(dep: AnySignal) {
-      dep.options?.[subtle.unwatched]?.call(dep);
-    },
   });
+  const nursery: alien.Subscriber = {
+    flags: alien.SubscriberFlags.None,
+    deps: undefined,
+    depsTail: undefined,
+  };
 
-  let globalVersion = 0;
+  let triggingCooling = false;
   let activeSub: alien.Subscriber | undefined;
 
   export function untrack<T>(fn: () => T) {
@@ -52,13 +43,14 @@ export namespace Signal {
   }
 
   export class State<T = any> implements alien.Dependency {
-    version = 0;
     subs: alien.Link | undefined = undefined;
     subsTail: alien.Link | undefined = undefined;
+    version = 0;
+    watchCount = 0;
 
     constructor(
       private currentValue: T,
-      public options?: Options<T>,
+      private options?: Options<T>,
     ) {
       if (options?.equals !== undefined) {
         this.equals = options.equals;
@@ -69,12 +61,29 @@ export namespace Signal {
       return Object.is(t, t2);
     }
 
+    onWatched() {
+      if (this.watchCount++ === 0) {
+        this.options?.[subtle.watched]?.call(this);
+      }
+    }
+
+    onUnwatched() {
+      if (--this.watchCount === 0) {
+        this.options?.[subtle.unwatched]?.call(this);
+      }
+    }
+
     get() {
       if (activeSub === WATCHER_PLACEHOLDER) {
         throw new Error('Cannot read from state inside watcher');
       }
       if (activeSub !== undefined) {
-        link(this, activeSub);
+        if (link(this, activeSub)) {
+          const newSub = this.subsTail!.sub;
+          if (newSub instanceof Computed && newSub.watchCount) {
+            this.onWatched();
+          }
+        }
       }
       return this.currentValue;
     }
@@ -84,7 +93,6 @@ export namespace Signal {
         throw new Error('Cannot write to state inside watcher');
       }
       if (!this.equals(this.currentValue, value)) {
-        globalVersion++;
         this.version++;
         this.currentValue = value;
         const subs = this.subs;
@@ -96,21 +104,20 @@ export namespace Signal {
     }
   }
 
-  const ErrorFlag = 1 << 8;
-
   export class Computed<T = any> implements alien.Dependency, alien.Subscriber {
     subs: alien.Link | undefined = undefined;
     subsTail: alien.Link | undefined = undefined;
     deps: alien.Link | undefined = undefined;
     depsTail: alien.Link | undefined = undefined;
-    flags = alien.SubscriberFlags.Computed | alien.SubscriberFlags.Dirty | ErrorFlag;
-    currentValue: T | undefined = undefined;
+    flags = alien.SubscriberFlags.Computed | alien.SubscriberFlags.Dirty;
+    isError = true;
     version = 0;
-    globalVersion = globalVersion;
+    watchCount = 0;
+    currentValue: T | undefined = undefined;
 
     constructor(
       private getter: () => T,
-      public options?: Options<T>,
+      private options?: Options<T>,
     ) {
       if (options?.equals !== undefined) {
         this.equals = options.equals;
@@ -121,6 +128,26 @@ export namespace Signal {
       return Object.is(t, t2);
     }
 
+    onWatched() {
+      if (this.watchCount++ === 0) {
+        this.options?.[subtle.watched]?.call(this);
+        for (let link = this.deps; link !== undefined; link = link.nextDep) {
+          const dep = link.dep as AnySignal;
+          dep.onWatched();
+        }
+      }
+    }
+
+    onUnwatched() {
+      if (--this.watchCount === 0) {
+        this.options?.[subtle.unwatched]?.call(this);
+        for (let link = this.deps; link !== undefined; link = link.nextDep) {
+          const dep = link.dep as AnySignal;
+          dep.onUnwatched();
+        }
+      }
+    }
+
     get() {
       if (activeSub === WATCHER_PLACEHOLDER) {
         throw new Error('Cannot read from computed inside watcher');
@@ -129,23 +156,22 @@ export namespace Signal {
       if (flags & alien.SubscriberFlags.Tracking) {
         throw new Error('Cycles detected');
       }
-      if (flags & alien.SubscriberFlags.Dirty) {
-        processComputedUpdate(this, flags);
-      } else if (this.subs === undefined) {
-        if (this.globalVersion !== globalVersion) {
-          this.globalVersion = globalVersion;
-          const deps = this.deps;
-          if (deps !== undefined && checkDirty(deps)) {
-            this.update();
-          }
-        }
-      } else if (flags & alien.SubscriberFlags.PendingComputed) {
+      if (flags & (alien.SubscriberFlags.Dirty | alien.SubscriberFlags.PendingComputed)) {
         processComputedUpdate(this, flags);
       }
       if (activeSub !== undefined) {
-        link(this, activeSub);
+        const newSub = link(this, activeSub)?.sub;
+        if (newSub instanceof Computed && newSub.watchCount) {
+          this.onWatched();
+        }
+      } else if (this.subs === undefined) {
+        link(this, nursery);
+        if (!triggingCooling) {
+          triggingCooling = true;
+          triggerCooling();
+        }
       }
-      if (this.flags & ErrorFlag) {
+      if (this.isError) {
         throw this.currentValue;
       }
       return this.currentValue!;
@@ -158,26 +184,43 @@ export namespace Signal {
       const oldValue = this.currentValue;
       try {
         const newValue = this.getter();
-        if (this.flags & ErrorFlag || !this.equals(oldValue!, newValue)) {
+        if (this.isError || !this.equals(oldValue!, newValue)) {
+          this.isError = false;
           this.version++;
-          this.flags &= ~ErrorFlag;
           this.currentValue = newValue;
           return true;
         }
         return false;
       } catch (err) {
-        if (!(this.flags & ErrorFlag) || !this.equals(oldValue!, err as any)) {
+        if (!this.isError || !this.equals(oldValue!, err as any)) {
+          this.isError = true;
           this.version++;
-          this.flags |= ErrorFlag;
           this.currentValue = err as any;
           return true;
         }
         return false;
       } finally {
+        if (this.watchCount) {
+          for (
+            let link = this.depsTail !== undefined ? this.depsTail.nextDep : this.deps;
+            link !== undefined;
+            link = link.nextDep
+          ) {
+            const dep = link.dep as AnySignal;
+            dep.onUnwatched();
+          }
+        }
         activeSub = prevSub;
         endTracking(this);
       }
     }
+  }
+
+  async function triggerCooling() {
+    await Promise.resolve(); // TODO: Confirm the scheduling logic
+    triggingCooling = false;
+    startTracking(nursery);
+    endTracking(nursery);
   }
 
   type AnySignal<T = any> = State<T> | Computed<T>;
@@ -187,8 +230,9 @@ export namespace Signal {
       deps: alien.Link | undefined = undefined;
       depsTail: alien.Link | undefined = undefined;
       flags = alien.SubscriberFlags.Effect;
+      watchList = new Set<AnySignal>();
 
-      constructor(private fn: () => void) { }
+      constructor(private fn: () => void) {}
 
       run() {
         const prevSub = activeSub;
@@ -202,15 +246,27 @@ export namespace Signal {
 
       watch(...signals: AnySignal[]): void {
         for (const signal of signals) {
+          if (this.watchList.has(signal)) {
+            continue;
+          }
+          this.watchList.add(signal);
           link(signal, this);
+          signal.onWatched();
         }
       }
 
       unwatch(...signals: AnySignal[]): void {
+        for (const signal of signals) {
+          if (!this.watchList.has(signal)) {
+            continue;
+          }
+          this.watchList.delete(signal);
+          signal.onUnwatched();
+        }
         startTracking(this);
         for (let _link = this.deps; _link !== undefined; _link = _link.nextDep) {
           const dep = _link.dep as AnySignal;
-          if (!signals.includes(dep)) {
+          if (this.watchList.has(dep)) {
             link(dep, this);
           }
         }
@@ -233,7 +289,7 @@ export namespace Signal {
     }
 
     export function hasSinks(signal: AnySignal) {
-      return signal.subs !== undefined;
+      return signal.watchCount > 0;
     }
 
     export function introspectSinks(signal: AnySignal) {
